@@ -11,7 +11,7 @@ window.addEventListener('unhandledrejection', e => {
 // Mirrors the CACHE version in sw.js — bump both together on every deploy. Shown on the login
 // screen and in the sidebar so it's possible to tell at a glance whether a browser is still
 // running an old cached copy of the app instead of guessing from symptoms.
-const APP_VERSION = 'v50';
+const APP_VERSION = 'v51';
 
 // ==================== STAGING MODE ====================
 // Open the app with ?staging=1 in the address bar to point every hotelData read/write at a
@@ -5475,7 +5475,7 @@ function logout() {
 
 function proceedLogout() {
     if (!confirm(t('logout_confirm') || 'Are you sure you want to logout?')) return;
-    if (window.fbDb) window.fbDb.ref(DATA_ROOT).off();
+    if (window.fbDb) { window.fbDb.ref(DATA_ROOT).off(); window.fbDb.ref('.info/serverTimeOffset').off(); }
     window._hotelDataListenerBound = false;
     window.fbAuth.signOut().then(() => {
         sessionStorage.removeItem('loggedInUser');
@@ -5501,6 +5501,14 @@ function recordTombstone(listName, id) {
 // changed since then, so only those get a new _rev stamp on save. A record nobody here touched
 // keeps its old _rev, so a fresher edit from another device (higher _rev) always wins the merge
 // below instead of silently getting overwritten by a slightly-stale local copy.
+// Difference between this device's clock and Firebase's server clock (ms, server - local). A
+// device with a wrong/skewed clock (very common on cheap hotel tablets) would otherwise stamp
+// _rev values that are chronologically wrong, causing its genuinely-newest edits to silently lose
+// the merge below against another device with a more accurate clock. Set once per session by
+// setupFirebaseRealtimeListener(); serverNow() below is Date.now() corrected by this offset.
+let _serverTimeOffset = 0;
+function serverNow() { return Date.now() + _serverTimeOffset; }
+
 let _syncSnapshot = { rooms: {}, guests: {} };
 
 // Order-independent JSON.stringify — two records with identical content but differently-ordered
@@ -5516,12 +5524,13 @@ function stableStringify(obj) {
 // baseline. MUST run right after hotelData is assigned from a fresh server read — skipping it
 // would make the next save think every record changed and re-stamp all of them, which defeats
 // the whole point (every record would then always "win" merges regardless of who touched what).
-function captureSyncSnapshot() {
+function captureSyncSnapshotFrom(data) {
     const snap = { rooms: {}, guests: {} };
-    (hotelData.rooms  || []).forEach(r => { const { _rev, ...rest } = r; snap.rooms[r.id]  = stableStringify(rest); });
-    (hotelData.guests || []).forEach(g => { const { _rev, ...rest } = g; snap.guests[g.id] = stableStringify(rest); });
+    (data.rooms  || []).forEach(r => { const { _rev, ...rest } = r; snap.rooms[r.id]  = stableStringify(rest); });
+    (data.guests || []).forEach(g => { const { _rev, ...rest } = g; snap.guests[g.id] = stableStringify(rest); });
     _syncSnapshot = snap;
 }
+function captureSyncSnapshot() { captureSyncSnapshotFrom(hotelData); }
 
 // Rooms and guests are the two collections every role touches constantly and concurrently —
 // reception checking a guest in on the front-desk terminal while a cleaner's tablet (which may
@@ -5540,7 +5549,7 @@ function saveDataToStorage() {
     // the tab closes before the Firebase write completes.
     localStorage.setItem(DATA_ROOT, JSON.stringify(hotelData));
 
-    const now = Date.now();
+    const now = serverNow();
     const stampChanged = (arr, snapshotKey) => {
         (arr || []).forEach(record => {
             const { _rev, ...rest } = record;
@@ -5552,7 +5561,10 @@ function saveDataToStorage() {
     stampChanged(hotelData.guests, 'guests');
 
     const dataToSave = hotelData; // frozen reference — realtime listener can reassign hotelData mid-save
-    const finish = () => { localStorage.setItem(DATA_ROOT, JSON.stringify(hotelData)); captureSyncSnapshot(); };
+    // Use dataToSave (not the live hotelData global) here — a realtime listener echo can reassign
+    // hotelData to a different object while this save is still in flight, and snapshotting that
+    // stale object instead of what was actually just written would poison the next save's baseline.
+    const finish = () => { localStorage.setItem(DATA_ROOT, JSON.stringify(dataToSave)); captureSyncSnapshotFrom(dataToSave); };
     const onFail = () => showToast('Could not save to the server — your last change may not have been saved. Check your connection.', 'error');
 
     window.fbDb.ref(DATA_ROOT).once('value').then(snap => {
@@ -6787,6 +6799,14 @@ function setupFirebaseRealtimeListener() {
     if (window._hotelDataListenerBound) return;
     window._hotelDataListenerBound = true;
     window.fbDb.ref(DATA_ROOT).on('value', snap => applyFreshHotelData(snap.val()));
+    // Keep _serverTimeOffset current for the life of the session — a device whose clock is wrong
+    // (common on cheap hotel tablets) would otherwise stamp _rev values that are chronologically
+    // wrong, causing its genuinely-newest edits to silently lose merges against a device with an
+    // accurate clock. Firebase's special .info/serverTimeOffset path gives (server time - local
+    // time) in ms with no extra round trip needed at save time.
+    window.fbDb.ref('.info/serverTimeOffset').on('value', snap => {
+        _serverTimeOffset = snap.val() || 0;
+    });
 
     // A phone/tab that's been backgrounded (screen locked, app switched away) can have its
     // realtime connection silently dropped by the OS to save battery — the .on('value') listener
